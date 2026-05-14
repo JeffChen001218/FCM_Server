@@ -1,25 +1,29 @@
 {
-  "googleServiceAccount": {
-    "path": "google-service-account.json"
-  },
-  "pollIntervalSeconds": 20,
-  "topic": "Trash_Shield",
-  "notification": {
-    "title": "Hello from FCM",
-    "body": "This message is sent on a timer.",
-    "imageUrl": null
-  },
-  "data": {
-    "type": "custom",
-    "source": "FCM_Server"
-  },
-  "android": {
-    "priority": "high",
-    "channelId": "default",
-    "clickAction": "OPEN_MAIN"
-  },
-  "apns": {
-    "sound": "default",
-    "badge": 1
-  }
+  "serverPort": 9999,
+  "configs": [
+    {
+      "id": "trash-shield",
+      "name": "Trash Shield",
+      "enabled": true,
+      "googleServiceAccount": {
+        "path": "Trash Shield/google-service-account.json"
+      },
+      "pollIntervalSeconds": 20,
+      "topic": "Trash_Shield",
+      "notification": {
+        "title": "  ",
+        "body": "  ",
+        "imageUrl": null
+      },
+      "data": {
+        "type": "custom",
+        "source": "FCM_Server"
+      },
+      "android": {
+        "priority": "high",
+        "channelId": "default",
+        "clickAction": "OPEN_MAIN"
+      }
+    }
+  ]
 }
