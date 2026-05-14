@@ -43,3 +43,8 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+# Local FCM runtime config and Google service-account credentials.
+config/fcm-sender.json
+config/google-service-account.example.json
+*.service-account.json
