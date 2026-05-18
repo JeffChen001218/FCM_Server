@@ -6,6 +6,31 @@ plugins {
 group = "org.example"
 version = "1.0-SNAPSHOT"
 
+val appMainClass = "org.example.MainKt"
+
+application {
+    mainClass.set(appMainClass)
+}
+
+tasks.jar.configure {
+    manifest {
+        attributes["Main-Class"] = appMainClass
+    }
+    from({
+        configurations.runtimeClasspath.get()
+            .filter { it.exists() }
+            .map { file ->
+                if (file.isDirectory) {
+                    file
+                } else {
+                    zipTree(file)
+                }
+            }
+    })
+    exclude("META-INF/*.RSA", "META-INF/*.DSA", "META-INF/*.SF")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
 repositories {
     mavenCentral()
 }
@@ -21,10 +46,6 @@ tasks.test {
     useJUnitPlatform()
 }
 
-application {
-    mainClass.set("org.example.MainKt")
-}
-
 kotlin {
-    jvmToolchain(23)
+    jvmToolchain(20)
 }
