@@ -38,6 +38,9 @@ repositories {
 dependencies {
     implementation("com.google.firebase:firebase-admin:9.8.0")
     implementation("com.google.code.gson:gson:2.14.0")
+    implementation("com.google.apis:google-api-services-androidpublisher:v3-rev20260528-2.0.0")
+    implementation("com.google.api-client:google-api-client:2.9.0")
+    implementation("com.google.auth:google-auth-library-oauth2-http:1.47.0")
 
     testImplementation(kotlin("test"))
 }

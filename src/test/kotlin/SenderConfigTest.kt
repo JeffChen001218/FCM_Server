@@ -151,6 +151,90 @@ class SenderConfigTest {
     }
 
     @Test
+    fun `write persists review status check metadata`() {
+        val configDirectory = createTempDirectory().toFile()
+        val configFile = configDirectory.resolve("fcm-sender.json")
+        val store = SenderConfigStore(configFile)
+
+        val saved = store.write(
+            SenderConfigDocument(
+                configs = listOf(
+                    minimalConfig("news").copy(
+                        reviewStatusCheck = ReviewStatusCheckConfig(
+                            packageName = " com.example.news ",
+                            track = " production ",
+                            lastVersion = " 20260601 ",
+                            lastCheckedAt = " 2026-06-02T00:00:00Z ",
+                            lastStatus = ReviewStatusCheckStatus.ONLINE,
+                            lastResult = " VersionCode 20260601 is online. ",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val reviewStatusCheck = saved.configs.orEmpty().single().reviewStatusCheck
+
+        assertEquals("com.example.news", reviewStatusCheck?.packageName)
+        assertEquals("production", reviewStatusCheck?.track)
+        assertEquals("20260601", reviewStatusCheck?.lastVersion)
+        assertEquals("2026-06-02T00:00:00Z", reviewStatusCheck?.lastCheckedAt)
+        assertEquals(ReviewStatusCheckStatus.ONLINE, reviewStatusCheck?.lastStatus)
+        assertEquals("VersionCode 20260601 is online.", reviewStatusCheck?.lastResult)
+        assertTrue(configFile.readText().contains("\"reviewStatusCheck\""))
+    }
+
+    @Test
+    fun `review status check without package name records first failure result`() {
+        val checked = ReviewStatusChecker().check(
+            minimalConfig("news").copy(reviewStatusCheck = ReviewStatusCheckConfig()),
+            versionCode = 20260601,
+        )
+        val config = checked.config
+
+        assertEquals("20260601", config.lastVersion)
+        assertEquals(ReviewStatusCheckStatus.FAILED, config.lastStatus)
+        assertTrue(config.lastCheckedAt?.isNotBlank() == true)
+        assertEquals("Google Play package name is not configured.", config.lastResult)
+    }
+
+    @Test
+    fun `review status check preserves previous successful result after later failure`() {
+        val checked = ReviewStatusChecker { _, _, _ -> error("network down") }.check(
+            minimalConfig("news").copy(
+                reviewStatusCheck = ReviewStatusCheckConfig(
+                    packageName = "com.example.news",
+                    track = "production",
+                    lastVersion = "20260601",
+                    lastCheckedAt = "2026-06-02T00:00:00Z",
+                    lastStatus = ReviewStatusCheckStatus.ONLINE,
+                    lastResult = "VersionCode 20260601 is online on production.",
+                ),
+            ),
+            versionCode = 20260602,
+        )
+        val config = checked.config
+
+        assertEquals("network down", checked.error)
+        assertEquals("20260601", config.lastVersion)
+        assertEquals("2026-06-02T00:00:00Z", config.lastCheckedAt)
+        assertEquals(ReviewStatusCheckStatus.ONLINE, config.lastStatus)
+        assertEquals("VersionCode 20260601 is online on production.", config.lastResult)
+    }
+
+    @Test
+    fun `review status check defaults track to beta`() {
+        val reviewStatusCheck = ReviewStatusCheckConfig(track = null).validated()
+
+        assertEquals("beta", reviewStatusCheck.track)
+    }
+
+    @Test
+    fun `review status check normalizes legacy track aliases`() {
+        assertEquals("production", ReviewStatusCheckConfig(track = " product ").validated().track)
+        assertEquals("qa", ReviewStatusCheckConfig(track = " internal ").validated().track)
+    }
+
+    @Test
     fun `service account falls back to firebase adminsdk file in same directory`() {
         val configDirectory = createTempDirectory().toFile()
         val missingConfiguredFile = configDirectory.resolve("google-firebase-account.json")

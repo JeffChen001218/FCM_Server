@@ -26,8 +26,11 @@ Each `configs[]` item supports:
 - `notification`: visible push notification content.
 - `data`: custom key-value payload delivered with the message.
 - `android`: optional Android-specific priority/channel/click action.
+- `reviewStatusCheck`: optional manual Google Play review-status checker. Set `packageName` to the Android application id and `track` to the Google Play track (`beta`, `qa`, `alpha`, or `production`; default `beta`). Existing `internal` and `product` values are still accepted and normalized to `qa` and `production`. The console checks the entered Google Play `versionCode` with the configured service account and persists the last displayed result.
 
 Place Google Console service-account JSON files under each config item's folder next to `fcm-sender.json`, or set `googleServiceAccount.path` to an absolute path. Relative paths are resolved from the directory that contains `fcm-sender.json`. If the configured file is missing, the sender also checks the same directory for a Firebase Admin SDK file named like `xxx-firebase-adminsdk-xxx-xxx.json`.
+
+For review-status checks, grant the same service account access to the app in Google Play Console and allow the Google Play Android Developer API. The checker uses the read-only Google Play releases endpoint, so it only reads release status and does not create or modify Play Console edits. The check treats `COMPLETED` and `IN_PROGRESS` releases on the selected track as online.
 
 Android messages are sent with high priority and a 10-second TTL, so undelivered messages expire quickly instead of being cached for later delivery.
 
@@ -43,7 +46,7 @@ Open the local console:
 http://127.0.0.1:9999/
 ```
 
-If `serverPort` is changed, use that port instead. The console loads existing configs and supports adding, pausing, re-enabling, and removing items. Saves update `fcm-sender.json` and notify the sender to reload immediately; the sender also refreshes from disk every 1 minute.
+If `serverPort` is changed, use that port instead. The console loads existing configs and supports adding, pausing, re-enabling, removing items, and manually checking Google Play status by versionCode. New items start paused until enabled. Saves update `fcm-sender.json` and notify the sender to reload immediately; the sender also refreshes from disk every 1 minute.
 
 You can point to another config file:
 
