@@ -1,6 +1,12 @@
 package org.example
 
+import com.google.api.client.googleapis.json.GoogleJsonResponseException
+import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport
+import com.google.api.client.json.gson.GsonFactory
+import com.google.api.services.androidpublisher.AndroidPublisher
+import com.google.api.services.androidpublisher.model.ReleaseSummary
 import com.google.auth.oauth2.GoogleCredentials
+import com.google.auth.http.HttpCredentialsAdapter
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import com.google.firebase.messaging.AndroidConfig
@@ -15,6 +21,7 @@ import com.google.gson.annotations.SerializedName
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import java.io.File
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.security.MessageDigest
 import java.time.Duration
@@ -30,10 +37,75 @@ private const val GOOGLE_SERVICE_ACCOUNT_FILE_NAME = "google-service-account.jso
 private const val DEFAULT_POLL_INTERVAL_SECONDS = 20L
 private const val DEFAULT_NOTIFICATION_TEXT = "  "
 private const val FCM_MESSAGE_TTL_SECONDS = 10L
+private const val DEFAULT_REVIEW_TRACK = "alpha"
+private const val GOOGLE_PLAY_APPLICATION_NAME = "FCM_Server/1.0"
 private val configJson: Gson = GsonBuilder().setPrettyPrinting().create()
 
 private fun defaultGoogleServiceAccountPath(itemName: String): String =
     "$itemName/$GOOGLE_SERVICE_ACCOUNT_FILE_NAME"
+
+private val supportedReviewTracks = linkedMapOf(
+    "production" to "正式版 (Production)",
+    "beta" to "开放式测试 (Open Testing)",
+    "internal" to "内部测试 (Internal Testing)",
+    "alpha" to "封闭式测试 (Closed Testing)",
+)
+
+private fun validateReviewTrack(track: String?): String {
+    val normalized = track?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: DEFAULT_REVIEW_TRACK
+    require(normalized in supportedReviewTracks) {
+        "reviewStatusCheck.track must be one of ${supportedReviewTracks.keys.joinToString()}."
+    }
+    return normalized
+}
+
+private fun normalizeReviewReleaseState(state: String?): String =
+    state?.trim()?.uppercase()?.replace('-', '_').orEmpty()
+
+internal fun isOnlineReleaseLifecycleState(state: String?): Boolean =
+    normalizeReviewReleaseState(state) == "RELEASE_LIFECYCLE_STATE_PUBLISHED"
+
+enum class AppStatus {
+    ONLINE,
+    IN_REVIEW,
+    REJECTED,
+    REMOVED_OR_NOT_FOUND,
+    QUOTA_EXCEEDED,
+    PERMISSION_DENIED,
+    UNKNOWN,
+}
+
+data class AppStatusLookupResult(
+    val status: AppStatus,
+    val detail: String? = null,
+    val lifecycleState: String? = null,
+    val releaseName: String? = null,
+) {
+    fun toReviewStatusCheckStatus(): ReviewStatusCheckStatus = when (status) {
+        AppStatus.ONLINE -> ReviewStatusCheckStatus.ONLINE
+        AppStatus.IN_REVIEW -> ReviewStatusCheckStatus.IN_REVIEW
+        AppStatus.REJECTED -> ReviewStatusCheckStatus.REJECTED
+        AppStatus.REMOVED_OR_NOT_FOUND -> ReviewStatusCheckStatus.REMOVED_OR_NOT_FOUND
+        AppStatus.QUOTA_EXCEEDED -> ReviewStatusCheckStatus.QUOTA_EXCEEDED
+        AppStatus.PERMISSION_DENIED -> ReviewStatusCheckStatus.PERMISSION_DENIED
+        AppStatus.UNKNOWN -> ReviewStatusCheckStatus.UNKNOWN
+    }
+
+    fun describe(track: String, versionCode: Long): String {
+        val lifecycleText = lifecycleState?.let { " lifecycleState=$it." }.orEmpty()
+        val releaseText = releaseName?.takeIf { it.isNotBlank() }?.let { " release=$it." }.orEmpty()
+        val detailText = detail?.takeIf { it.isNotBlank() }?.let { " $it" }.orEmpty()
+        return when (status) {
+            AppStatus.ONLINE -> "Track $track is online for package status query. Entered versionCode $versionCode.$lifecycleText$releaseText$detailText".trim()
+            AppStatus.IN_REVIEW -> "Track $track is still in review or pending publish. Entered versionCode $versionCode.$lifecycleText$releaseText$detailText".trim()
+            AppStatus.REJECTED -> "Track $track was rejected in review. Entered versionCode $versionCode.$lifecycleText$releaseText$detailText".trim()
+            AppStatus.REMOVED_OR_NOT_FOUND -> "Track $track or package was removed, blocked, or not found. Entered versionCode $versionCode.$detailText".trim()
+            AppStatus.QUOTA_EXCEEDED -> "Google Play API quota exceeded while checking track $track. Entered versionCode $versionCode.$detailText".trim()
+            AppStatus.PERMISSION_DENIED -> "Google Play API permission denied while checking track $track. Entered versionCode $versionCode.$detailText".trim()
+            AppStatus.UNKNOWN -> "Track $track returned an unknown status for entered versionCode $versionCode.$lifecycleText$releaseText$detailText".trim()
+        }
+    }
+}
 
 fun main(args: Array<String>) {
     val configPath = args.firstOrNull()
@@ -213,6 +285,7 @@ class FcmScheduler(
 class ConfigWebServer(
     private val store: SenderConfigStore,
     private val onConfigChanged: () -> Unit,
+    private val reviewStatusChecker: ReviewStatusChecker = ReviewStatusChecker(),
 ) {
     private var server: HttpServer? = null
 
@@ -226,6 +299,7 @@ class ConfigWebServer(
                 exchange.requestMethod == "GET" && exchange.requestURI.path == "/" -> exchange.respondHtml(MANAGEMENT_PAGE)
                 exchange.requestMethod == "GET" && exchange.requestURI.path == "/api/config" -> handleReadConfig(exchange)
                 exchange.requestMethod == "PUT" && exchange.requestURI.path == "/api/config" -> handleWriteConfig(exchange)
+                exchange.requestMethod == "POST" && exchange.requestURI.path == "/api/review-status/check" -> handleReviewStatusCheck(exchange)
                 else -> exchange.respondText(404, "Not found")
             }
         }
@@ -265,6 +339,68 @@ class ConfigWebServer(
             exchange.respondJson(200, store.toDisplayResponse(saved))
         }.onFailure { error ->
             exchange.respondJson(400, ErrorResponse(error.message ?: "Config save failed."))
+        }
+    }
+
+    private fun handleReviewStatusCheck(exchange: HttpExchange) {
+        val body = exchange.requestBody.bufferedReader().use { it.readText() }
+        val request = runCatching {
+            requireNotNull(configJson.fromJson(body, ReviewStatusCheckRequest::class.java)) {
+                "Request body must contain a JSON object."
+            }
+        }.getOrElse { error ->
+            exchange.respondJson(400, ErrorResponse("Invalid JSON: ${error.message}"))
+            return
+        }
+
+        runCatching {
+            val configId = request.configId?.trim()?.takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("configId must be provided.")
+            val version = request.version?.trim()?.takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("version must be provided.")
+            val versionCode = version.toLongOrNull()
+                ?: throw IllegalArgumentException("version must be a numeric Google Play versionCode.")
+            require(versionCode > 0) { "version must be a positive Google Play versionCode." }
+
+            val resolvedDocument = store.read()
+            val displayDocument = store.readForDisplay()
+            val resolvedConfigs = resolvedDocument.configs.orEmpty()
+            val displayConfigs = displayDocument.configs.orEmpty()
+            val configIndex = displayConfigs.indexOfFirst { it.id == configId }
+            require(configIndex >= 0) { "Config not found: $configId" }
+            val resolvedConfig = resolvedConfigs.firstOrNull { it.id == configId }
+                ?: throw IllegalArgumentException("Config not found: $configId")
+
+            val updatedConfigs = displayConfigs.toMutableList()
+            val currentDisplayConfig = updatedConfigs[configIndex]
+            val requestedReviewStatusCheck = (currentDisplayConfig.reviewStatusCheck ?: ReviewStatusCheckConfig()).copy(
+                packageName = request.packageName?.trim()?.takeIf { it.isNotBlank() },
+                track = request.track?.trim()?.takeIf { it.isNotBlank() },
+            )
+            val configForCheck = resolvedConfig.copy(
+                reviewStatusCheck = (resolvedConfig.reviewStatusCheck ?: ReviewStatusCheckConfig()).copy(
+                    packageName = request.packageName?.trim()?.takeIf { it.isNotBlank() },
+                    track = request.track?.trim()?.takeIf { it.isNotBlank() },
+                ),
+            )
+            val checkResult = reviewStatusChecker.check(configForCheck, versionCode)
+            updatedConfigs[configIndex] = currentDisplayConfig.copy(
+                reviewStatusCheck = requestedReviewStatusCheck.copy(
+                    lastVersion = checkResult.config.lastVersion,
+                    lastCheckedAt = checkResult.config.lastCheckedAt,
+                    lastStatus = checkResult.config.lastStatus,
+                    lastResult = checkResult.config.lastResult,
+                ),
+            )
+
+            val saved = store.write(displayDocument.copy(configs = updatedConfigs))
+            ReviewStatusCheckResponse.from(store.toDisplayResponse(saved), checkResult.error)
+        }.onSuccess { saved ->
+            exchange.respondJson(200, saved)
+        }.onFailure { error ->
+            System.err.println("[${Instant.now()}] Review status check request failed: ${error.message}")
+            error.printStackTrace()
+            exchange.respondJson(400, ErrorResponse(error.message ?: "Review status check failed."))
         }
     }
 }
@@ -332,6 +468,232 @@ class FcmTopicSender(
     }
 }
 
+class ReviewStatusChecker(
+    private val appStatusLookup: (SenderConfig, ReviewStatusCheckConfig, Long) -> AppStatusLookupResult = { config, reviewStatusCheck, versionCode ->
+        checkAppStatus(config, reviewStatusCheck, versionCode)
+    },
+) {
+    fun check(config: SenderConfig, versionCode: Long): ReviewStatusCheckResult {
+        val base = config.reviewStatusCheck?.validated() ?: ReviewStatusCheckConfig()
+        val checkedAt = Instant.now().toString()
+        val packageName = base.packageName?.takeIf { it.isNotBlank() }
+
+        if (packageName == null) {
+            logReviewStatusFailure(
+                config = config,
+                reviewStatusCheck = base,
+                versionCode = versionCode,
+                message = "Google Play package name is not configured.",
+                preservedPrevious = base.hasDisplayedResult(),
+            )
+            return base.failureResult(
+                checkedAt = checkedAt,
+                versionCode = versionCode,
+                message = "Google Play package name is not configured.",
+            )
+        }
+
+        return runCatching {
+            val lookupResult = appStatusLookup(config, base, versionCode)
+            ReviewStatusCheckResult(
+                config = base.copy(
+                    lastVersion = versionCode.toString(),
+                    lastCheckedAt = checkedAt,
+                    lastStatus = lookupResult.toReviewStatusCheckStatus(),
+                    lastResult = lookupResult.describe(track = base.track ?: DEFAULT_REVIEW_TRACK, versionCode = versionCode),
+                ),
+            )
+        }.getOrElse { error ->
+            if (error is InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            val message = error.message ?: error.javaClass.simpleName
+            logReviewStatusFailure(
+                config = config,
+                reviewStatusCheck = base,
+                versionCode = versionCode,
+                message = message,
+                preservedPrevious = base.hasDisplayedResult(),
+                error = error,
+            )
+            base.failureResult(
+                checkedAt = checkedAt,
+                versionCode = versionCode,
+                message = message,
+            )
+        }
+    }
+
+    private fun logReviewStatusFailure(
+        config: SenderConfig,
+        reviewStatusCheck: ReviewStatusCheckConfig,
+        versionCode: Long,
+        message: String,
+        preservedPrevious: Boolean,
+        error: Throwable? = null,
+    ) {
+        val packageName = reviewStatusCheck.packageName ?: "(not configured)"
+        val track = reviewStatusCheck.track ?: DEFAULT_REVIEW_TRACK
+        val preservedText = if (preservedPrevious) ", preservedPreviousResult=true" else ""
+        System.err.println(
+            "[${Instant.now()}] Review status check failed for '${config.displayName}' " +
+                "(id=${config.id}, package=$packageName, track=$track, versionCode=$versionCode$preservedText): $message",
+        )
+        error?.printStackTrace()
+    }
+
+    private fun ReviewStatusCheckConfig.hasDisplayedResult(): Boolean =
+        lastStatus != null && lastStatus != ReviewStatusCheckStatus.FAILED
+
+    private fun ReviewStatusCheckConfig.failureResult(
+        checkedAt: String,
+        versionCode: Long,
+        message: String,
+    ): ReviewStatusCheckResult =
+        if (hasDisplayedResult()) {
+            ReviewStatusCheckResult(config = this, error = message)
+        } else {
+            ReviewStatusCheckResult(
+                config = copy(
+                    lastVersion = versionCode.toString(),
+                    lastCheckedAt = checkedAt,
+                    lastStatus = ReviewStatusCheckStatus.FAILED,
+                    lastResult = message,
+                ),
+            )
+        }
+
+    companion object {
+        private fun checkAppStatus(
+            config: SenderConfig,
+            reviewStatusCheck: ReviewStatusCheckConfig,
+            versionCode: Long,
+        ): AppStatusLookupResult {
+            val serviceAccountFile = config.requireServiceAccount().resolveFile()
+            require(serviceAccountFile.exists()) {
+                "Google service account JSON not found: ${serviceAccountFile.absolutePath}"
+            }
+
+            val publisher = createAndroidPublisher(serviceAccountFile)
+            val packageName = requireNotNull(reviewStatusCheck.packageName) { "Google Play package name is not configured." }
+            val targetTrack = validateReviewTrack(reviewStatusCheck.track)
+            val trackParent = "applications/$packageName/tracks/$targetTrack"
+
+            try {
+                val releaseSummaries = publisher.applications()
+                    .tracks()
+                    .releases()
+                    .list(trackParent)
+                    .execute()
+                logGooglePlayReleaseResponse(packageName, targetTrack, versionCode, releaseSummaries)
+                val releases = releaseSummaries?.releases.orEmpty()
+                val latestRelease = releases.firstOrNull()
+                    ?: return AppStatusLookupResult(
+                        status = AppStatus.UNKNOWN,
+                        detail = "Google Play returned no releases for track '$targetTrack'.",
+                    )
+                val lifecycleState = resolveLifecycleState(latestRelease)
+
+                return AppStatusLookupResult(
+                    status = mapLifecycleStateToAppStatus(lifecycleState),
+                    lifecycleState = lifecycleState,
+                    releaseName = latestRelease.releaseName,
+                )
+            } catch (error: GoogleJsonResponseException) {
+                logGooglePlayErrorResponse(packageName, targetTrack, versionCode, error)
+                return error.toAppStatusLookupResult()
+            } catch (error: IOException) {
+                return AppStatusLookupResult(
+                    status = AppStatus.UNKNOWN,
+                    detail = error.message ?: "Google Play Developer API request failed for $trackParent.",
+                )
+            } catch (error: Exception) {
+                return AppStatusLookupResult(
+                    status = AppStatus.UNKNOWN,
+                    detail = error.message ?: error.javaClass.simpleName,
+                )
+            }
+        }
+
+        private fun resolveLifecycleState(release: ReleaseSummary): String? =
+            release.get("releaseLifecycleState")?.toString()
+                ?: release.get("status")?.toString()
+
+        private fun mapLifecycleStateToAppStatus(state: String?): AppStatus =
+            when (normalizeReviewReleaseState(state)) {
+                "RELEASE_LIFECYCLE_STATE_PUBLISHED", "COMPLETED" -> AppStatus.ONLINE
+                "RELEASE_LIFECYCLE_STATE_IN_REVIEW",
+                "RELEASE_LIFECYCLE_STATE_APPROVED_NOT_PUBLISHED",
+                "RELEASE_LIFECYCLE_STATE_NOT_SENT_FOR_REVIEW",
+                "DRAFT",
+                -> AppStatus.IN_REVIEW
+                "RELEASE_LIFECYCLE_STATE_NOT_APPROVED" -> AppStatus.REJECTED
+                else -> AppStatus.ONLINE
+            }
+
+        private fun GoogleJsonResponseException.toAppStatusLookupResult(): AppStatusLookupResult {
+            val detail = details?.message ?: statusMessage ?: message ?: "Google Play Developer API request failed."
+            return when (statusCode) {
+                404 -> AppStatusLookupResult(status = AppStatus.REMOVED_OR_NOT_FOUND, detail = detail)
+                403 -> {
+                    if (isQuotaExceeded(details?.message, details?.errors?.firstOrNull()?.reason)) {
+                        AppStatusLookupResult(status = AppStatus.QUOTA_EXCEEDED, detail = detail)
+                    } else {
+                        AppStatusLookupResult(status = AppStatus.PERMISSION_DENIED, detail = detail)
+                    }
+                }
+                else -> AppStatusLookupResult(status = AppStatus.UNKNOWN, detail = detail)
+            }
+        }
+
+        private fun isQuotaExceeded(message: String?, reason: String?): Boolean {
+            val normalizedMessage = message.orEmpty().lowercase()
+            val normalizedReason = reason.orEmpty().lowercase()
+            return "quota exceeded" in normalizedMessage ||
+                "quotaexceeded" in normalizedReason ||
+                "ratelimitexceeded" in normalizedReason
+        }
+
+        private fun logGooglePlayReleaseResponse(
+            packageName: String,
+            track: String,
+            versionCode: Long,
+            releaseSummaries: Any?,
+        ) {
+            System.out.println(
+                "[${Instant.now()}] Google Play releases response " +
+                    "(package=$packageName, track=$track, versionCode=$versionCode): ${configJson.toJson(releaseSummaries)}",
+            )
+        }
+
+        private fun logGooglePlayErrorResponse(
+            packageName: String,
+            track: String,
+            versionCode: Long,
+            error: GoogleJsonResponseException,
+        ) {
+            System.err.println(
+                "[${Instant.now()}] Google Play error response " +
+                    "(package=$packageName, track=$track, versionCode=$versionCode, status=${error.statusCode}): " +
+                    configJson.toJson(error.details),
+            )
+        }
+
+        private fun createAndroidPublisher(serviceAccountFile: File): AndroidPublisher {
+            val credentials = serviceAccountFile.inputStream().use { serviceAccount ->
+                GoogleCredentials.fromStream(serviceAccount)
+                    .createScoped(listOf("https://www.googleapis.com/auth/androidpublisher"))
+            }
+            val httpTransport = GoogleNetHttpTransport.newTrustedTransport()
+            val jsonFactory = GsonFactory.getDefaultInstance()
+
+            return AndroidPublisher.Builder(httpTransport, jsonFactory, HttpCredentialsAdapter(credentials))
+                .setApplicationName(GOOGLE_PLAY_APPLICATION_NAME)
+                .build()
+        }
+    }
+}
+
 data class SenderConfigDocument(
     val serverPort: Int? = DEFAULT_SERVER_PORT,
     val configs: List<SenderConfig>? = emptyList(),
@@ -368,6 +730,7 @@ data class SenderConfig(
     val notification: NotificationConfig? = null,
     val data: Map<String, String> = emptyMap(),
     val android: AndroidMessageConfig? = null,
+    val reviewStatusCheck: ReviewStatusCheckConfig? = null,
 ) {
     val pollInterval: Duration
         get() = Duration.ofSeconds(pollIntervalSeconds)
@@ -400,6 +763,7 @@ data class SenderConfig(
             notification = notification?.validated(),
             data = messageData,
             android = android?.validated(),
+            reviewStatusCheck = reviewStatusCheck?.validated(),
         )
     }
 
@@ -531,6 +895,81 @@ enum class AndroidPriority {
     fun toFirebasePriority(): AndroidConfig.Priority = when (this) {
         NORMAL -> AndroidConfig.Priority.NORMAL
         HIGH -> AndroidConfig.Priority.HIGH
+    }
+}
+
+data class ReviewStatusCheckConfig(
+    val packageName: String? = null,
+    val track: String? = DEFAULT_REVIEW_TRACK,
+    val lastVersion: String? = null,
+    val lastCheckedAt: String? = null,
+    val lastStatus: ReviewStatusCheckStatus? = null,
+    val lastResult: String? = null,
+) {
+    fun validated(): ReviewStatusCheckConfig = copy(
+        packageName = packageName?.trim()?.takeIf { it.isNotBlank() },
+        track = validateReviewTrack(track),
+        lastVersion = lastVersion?.trim()?.takeIf { it.isNotBlank() },
+        lastCheckedAt = lastCheckedAt?.trim()?.takeIf { it.isNotBlank() },
+        lastResult = lastResult?.trim()?.takeIf { it.isNotBlank() },
+    )
+}
+
+enum class ReviewStatusCheckStatus {
+    @SerializedName("online")
+    ONLINE,
+
+    @SerializedName("in_review")
+    IN_REVIEW,
+
+    @SerializedName("rejected")
+    REJECTED,
+
+    @SerializedName("removed_or_not_found")
+    REMOVED_OR_NOT_FOUND,
+
+    @SerializedName("quota_exceeded")
+    QUOTA_EXCEEDED,
+
+    @SerializedName("permission_denied")
+    PERMISSION_DENIED,
+
+    @SerializedName("unknown")
+    UNKNOWN,
+
+    @SerializedName("offline")
+    OFFLINE,
+
+    @SerializedName("failed")
+    FAILED,
+}
+
+data class ReviewStatusCheckRequest(
+    val configId: String?,
+    val version: String?,
+    val packageName: String? = null,
+    val track: String? = null,
+)
+
+data class ReviewStatusCheckResult(
+    val config: ReviewStatusCheckConfig,
+    val error: String? = null,
+)
+
+data class ReviewStatusCheckResponse(
+    val configPath: String,
+    val serverPort: Int?,
+    val configs: List<SenderConfig>?,
+    val reviewError: String? = null,
+) {
+    companion object {
+        fun from(response: SenderConfigResponse, reviewError: String?): ReviewStatusCheckResponse =
+            ReviewStatusCheckResponse(
+                configPath = response.configPath,
+                serverPort = response.serverPort,
+                configs = response.configs,
+                reviewError = reviewError,
+            )
     }
 }
 
@@ -722,6 +1161,9 @@ private val MANAGEMENT_PAGE = """
       padding: 9px 10px;
       font: inherit;
     }
+    input.field-attention {
+      animation: fieldAttention 1s ease-in-out 2;
+    }
     textarea {
       min-height: 96px;
       resize: vertical;
@@ -736,6 +1178,89 @@ private val MANAGEMENT_PAGE = """
       align-items: end;
       gap: 10px;
     }
+    .review-section {
+      display: grid;
+      gap: 12px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .section-title {
+      margin: 0;
+      color: var(--text);
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    .review-settings {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(130px, 190px);
+      gap: 10px;
+    }
+    .review-query {
+      display: grid;
+      grid-template-columns: minmax(150px, 210px) auto minmax(300px, 1fr);
+      align-items: end;
+      gap: 10px;
+    }
+    .review-query button { min-width: 96px; }
+    .review-result {
+      min-height: 40px;
+      display: grid;
+      align-content: center;
+      gap: 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: rgba(248, 251, 253, .9);
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      font-size: 13px;
+      transition: border-color .18s ease, background .18s ease, color .18s ease;
+    }
+    .review-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      animation: reviewFadeIn .18s ease both;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .review-line + .review-line {
+      color: var(--text);
+      font-weight: 800;
+    }
+    .review-line.checking::before {
+      width: 6px;
+      height: 6px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: currentColor;
+      content: "";
+      animation: reviewPulse .9s ease-in-out infinite;
+    }
+    .review-result.online { border-color: rgba(15, 118, 110, .45); }
+    .review-result.in_review { border-color: rgba(202, 138, 4, .45); color: #a16207; }
+    .review-result.rejected { border-color: rgba(180, 35, 24, .45); color: var(--danger); }
+    .review-result.removed_or_not_found { border-color: rgba(107, 114, 128, .45); color: #4b5563; }
+    .review-result.quota_exceeded { border-color: rgba(217, 119, 6, .45); color: #b45309; }
+    .review-result.permission_denied { border-color: rgba(180, 35, 24, .45); color: var(--danger); }
+    .review-result.unknown { border-color: rgba(59, 130, 246, .35); color: #1d4ed8; }
+    .review-result.offline { border-color: rgba(154, 91, 0, .45); color: var(--warn); }
+    .review-result.failed { border-color: rgba(180, 35, 24, .45); color: var(--danger); }
+    .review-result.checking { border-color: rgba(37, 99, 235, .35); background: rgba(248, 251, 253, .98); }
+    @keyframes reviewFadeIn {
+      from { opacity: 0; transform: translateY(2px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes reviewPulse {
+      0%, 100% { opacity: .35; transform: scale(.88); }
+      50% { opacity: 1; transform: scale(1); }
+    }
+    @keyframes fieldAttention {
+      0%, 100% { border-color: var(--line); box-shadow: none; }
+      25%, 75% { border-color: var(--danger); box-shadow: 0 0 0 3px rgba(180, 35, 24, .16); }
+    }
     .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
     .message { min-height: 20px; margin-top: 12px; color: var(--muted); font-size: 13px; }
     .message.error { color: var(--danger); font-weight: 800; }
@@ -745,6 +1270,8 @@ private val MANAGEMENT_PAGE = """
       main { grid-template-columns: 1fr; padding: 14px; }
       .grid { grid-template-columns: 1fr; }
       .path-field { grid-template-columns: 1fr; }
+      .review-settings { grid-template-columns: 1fr; }
+      .review-query { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -787,6 +1314,18 @@ private val MANAGEMENT_PAGE = """
           <label>Android priority<select id="androidPriority"><option value="high">high</option><option value="normal">normal</option></select></label>
           <label>Android channel ID<input id="androidChannelId"></label>
           <label>Android click action<input id="androidClickAction"></label>
+          <div class="full review-section">
+            <h3 class="section-title">Review status</h3>
+            <div class="review-settings">
+              <label>Google Play package name<input id="reviewPackageName"></label>
+              <label>轨道<select id="reviewTrack"><option value="production">正式版 (Production)</option><option value="beta">开放式测试 (Open Testing)</option><option value="internal">内部测试 (Internal Testing)</option><option value="alpha">封闭式测试 (Closed Testing)</option></select></label>
+            </div>
+            <div class="review-query">
+              <label>Version code<input id="reviewVersion" inputmode="numeric"></label>
+              <button id="checkReviewStatus" type="button">Check</button>
+              <div class="review-result" id="reviewStatusResult"></div>
+            </div>
+          </div>
         </div>
         <div class="actions">
           <button class="primary" type="submit">Save</button>
@@ -801,6 +1340,8 @@ private val MANAGEMENT_PAGE = """
     const form = document.getElementById('editorForm');
     const message = document.getElementById('message');
     const configPathElement = document.getElementById('configPath');
+    const reviewStatusResult = document.getElementById('reviewStatusResult');
+    const checkReviewStatusButton = document.getElementById('checkReviewStatus');
     const fields = {
       name: document.getElementById('name'),
       topic: document.getElementById('topic'),
@@ -813,7 +1354,10 @@ private val MANAGEMENT_PAGE = """
       dataJson: document.getElementById('dataJson'),
       androidPriority: document.getElementById('androidPriority'),
       androidChannelId: document.getElementById('androidChannelId'),
-      androidClickAction: document.getElementById('androidClickAction')
+      androidClickAction: document.getElementById('androidClickAction'),
+      reviewPackageName: document.getElementById('reviewPackageName'),
+      reviewTrack: document.getElementById('reviewTrack'),
+      reviewVersion: document.getElementById('reviewVersion')
     };
     let documentConfig = { configPath: '', serverPort: 9999, configs: [] };
     let selectedId = null;
@@ -908,7 +1452,9 @@ private val MANAGEMENT_PAGE = """
       form.hidden = !config;
       document.getElementById('toggleEnabled').disabled = !config;
       document.getElementById('removeConfig').disabled = !config;
+      checkReviewStatusButton.disabled = !config;
       if (!config) return;
+      const reviewStatusCheck = config.reviewStatusCheck || {};
       fields.name.value = config.name || '';
       fields.topic.value = config.topic || '';
       fields.serviceAccountPath.value = config.googleServiceAccount?.path || '';
@@ -921,8 +1467,92 @@ private val MANAGEMENT_PAGE = """
       fields.androidPriority.value = config.android?.priority || 'high';
       fields.androidChannelId.value = config.android?.channelId || '';
       fields.androidClickAction.value = config.android?.clickAction || '';
+      fields.reviewPackageName.value = reviewStatusCheck.packageName || '';
+      fields.reviewTrack.value = reviewStatusCheck.track || '${DEFAULT_REVIEW_TRACK}';
+      fields.reviewVersion.value = reviewStatusCheck.lastVersion || '';
       lastNameInputValue = fields.name.value;
       document.getElementById('toggleEnabled').textContent = config.enabled === false ? 'Enable' : 'Pause';
+      renderReviewStatus(config);
+    }
+
+    function renderReviewStatus(config, transient = null) {
+      const reviewStatusCheck = config.reviewStatusCheck || {};
+      const lastStatus = reviewStatusCheck.lastStatus || 'unchecked';
+      reviewStatusResult.textContent = '';
+      reviewStatusResult.className = `review-result ${'$'}{reviewStatusClass(transient?.status || lastStatus)}`;
+      if (transient) {
+        reviewStatusResult.append(createReviewLine(transient.result, transient.status));
+      }
+      reviewStatusResult.append(createReviewLine(lastReviewText(reviewStatusCheck), lastStatus, reviewStatusCheck.lastResult));
+    }
+
+    function createReviewLine(text, status, title = '') {
+      const line = document.createElement('div');
+      line.className = `review-line ${'$'}{reviewStatusClass(status)}`;
+      line.textContent = text;
+      if (title) line.title = title;
+      return line;
+    }
+
+    function lastReviewText(reviewStatusCheck) {
+      if (!reviewStatusCheck.lastCheckedAt || !reviewStatusCheck.lastStatus) {
+        return '尚未检查';
+      }
+
+      const trackLabel = reviewTrackLabel(reviewStatusCheck.track);
+      return `上次检测${'$'}{formatReviewTime(reviewStatusCheck.lastCheckedAt)}，${'$'}{reviewStatusIcon(reviewStatusCheck.lastStatus)} ${'$'}{reviewStatusLabel(reviewStatusCheck.lastStatus)}${'$'}{trackLabel ? ` · ${'$'}{trackLabel}` : ''}`;
+    }
+
+    function reviewTrackLabel(track) {
+      return {
+        production: '正式版 (Production)',
+        beta: '开放式测试 (Open Testing)',
+        internal: '内部测试 (Internal Testing)',
+        alpha: '封闭式测试 (Closed Testing)'
+      }[track] || track || '';
+    }
+
+    function reviewStatusLabel(status) {
+      return {
+        online: '在线',
+        in_review: '审核中',
+        rejected: '已拒绝',
+        removed_or_not_found: '已下架或不存在',
+        quota_exceeded: '配额超限',
+        permission_denied: '权限不足',
+        unknown: '未知状态',
+        offline: '不在线',
+        failed: '失败',
+        checking: '检查中',
+        unchecked: '未检查'
+      }[status] || status || '未检查';
+    }
+
+    function reviewStatusIcon(status) {
+      return {
+        online: '✅',
+        in_review: '🟡',
+        rejected: '⛔',
+        removed_or_not_found: '📭',
+        quota_exceeded: '⏳',
+        permission_denied: '🔒',
+        unknown: '❔',
+        offline: '⚪',
+        failed: '❌',
+        checking: '🔎'
+      }[status] || '•';
+    }
+
+    function reviewStatusClass(status) {
+      return ['online', 'in_review', 'rejected', 'removed_or_not_found', 'quota_exceeded', 'permission_denied', 'unknown', 'offline', 'failed', 'checking'].includes(status) ? status : '';
+    }
+
+    function formatReviewTime(value) {
+      if (!value) return '';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      const pad = number => String(number).padStart(2, '0');
+      return `${'$'}{date.getFullYear()}-${'$'}{pad(date.getMonth() + 1)}-${'$'}{pad(date.getDate())} ${'$'}{pad(date.getHours())}:${'$'}{pad(date.getMinutes())}:${'$'}{pad(date.getSeconds())}`;
     }
 
     function render() {
@@ -954,8 +1584,29 @@ private val MANAGEMENT_PAGE = """
           priority: fields.androidPriority.value,
           channelId: fields.androidChannelId.value.trim() || null,
           clickAction: fields.androidClickAction.value.trim() || null
-        }
+        },
+        reviewStatusCheck: readReviewStatusCheck(existing)
       };
+    }
+
+    function readReviewStatusCheck(existing) {
+      const reviewStatusCheck = {
+        ...(existing.reviewStatusCheck || {}),
+        packageName: fields.reviewPackageName.value.trim() || null,
+        track: fields.reviewTrack.value.trim() || '${DEFAULT_REVIEW_TRACK}'
+      };
+      if (
+        !reviewStatusCheck.packageName &&
+        !reviewStatusCheck.track &&
+        !reviewStatusCheck.lastVersion &&
+        !reviewStatusCheck.lastCheckedAt &&
+        !reviewStatusCheck.lastStatus &&
+        !reviewStatusCheck.lastResult
+      ) {
+        return null;
+      }
+
+      return reviewStatusCheck;
     }
 
     async function saveEditor() {
@@ -980,13 +1631,14 @@ private val MANAGEMENT_PAGE = """
         __isDraft: true,
         id,
         name,
-        enabled: true,
+        enabled: false,
         googleServiceAccount: { path: defaultServiceAccountPath(name) },
         pollIntervalSeconds: ${DEFAULT_POLL_INTERVAL_SECONDS},
         topic: 'news',
         notification: { title: '${DEFAULT_NOTIFICATION_TEXT}', body: '${DEFAULT_NOTIFICATION_TEXT}', imageUrl: null },
         data: {},
-        android: { priority: 'high', channelId: null, clickAction: null }
+        android: { priority: 'high', channelId: null, clickAction: null },
+        reviewStatusCheck: { packageName: null, track: '${DEFAULT_REVIEW_TRACK}', lastVersion: null, lastCheckedAt: null, lastStatus: null, lastResult: null }
       });
       selectedId = id;
       render();
@@ -1057,6 +1709,58 @@ private val MANAGEMENT_PAGE = """
       showMessage('Service-account path reset.');
     }
 
+    async function checkReviewStatus() {
+      const config = currentConfig();
+      if (!config) return;
+      if (config.__isDraft) throw new Error('Save this configuration before checking review status.');
+      const packageName = fields.reviewPackageName.value.trim();
+      if (!packageName) {
+        flashField(fields.reviewPackageName);
+        showMessage('Google Play package name is required.', true);
+        return;
+      }
+      const version = fields.reviewVersion.value.trim();
+      if (!/^[1-9]\d*$/.test(version)) throw new Error('Version code must be a positive integer.');
+
+      checkReviewStatusButton.disabled = true;
+      checkReviewStatusButton.textContent = 'Checking...';
+      renderReviewStatus(config, { status: 'checking', result: `${'$'}{reviewStatusIcon('checking')} 正在检查 versionCode ${'$'}{version}...` });
+
+      try {
+        const response = await fetch('/api/review-status/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            configId: config.id,
+            version,
+            packageName,
+            track: fields.reviewTrack.value.trim() || '${DEFAULT_REVIEW_TRACK}'
+          })
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || 'Review status check failed.');
+        const previousSelectedId = selectedId;
+        documentConfig = normalizeConfigResponse(payload);
+        selectedId = documentConfig.configs.some(item => item.id === previousSelectedId) ? previousSelectedId : documentConfig.configs[0]?.id ?? null;
+        render();
+        showMessage(payload.reviewError ? `Review status check failed; kept previous successful result: ${'$'}{payload.reviewError}` : 'Review status checked.');
+      } catch (error) {
+        renderReviewStatus(config);
+        throw error;
+      } finally {
+        checkReviewStatusButton.disabled = !currentConfig();
+        checkReviewStatusButton.textContent = 'Check';
+      }
+    }
+
+    function flashField(field) {
+      field.classList.remove('field-attention');
+      void field.offsetWidth;
+      field.classList.add('field-attention');
+      field.focus();
+      window.setTimeout(() => field.classList.remove('field-attention'), 2100);
+    }
+
     async function removeConfig() {
       const config = currentConfig();
       if (!config) return;
@@ -1103,6 +1807,7 @@ private val MANAGEMENT_PAGE = """
     });
     document.getElementById('removeConfig').addEventListener('click', () => removeConfig().catch(error => showMessage(error.message, true)));
     document.getElementById('toggleEnabled').addEventListener('click', () => toggleEnabled().catch(error => showMessage(error.message, true)));
+    checkReviewStatusButton.addEventListener('click', () => checkReviewStatus().catch(error => showMessage(error.message, true)));
     document.getElementById('refresh').addEventListener('click', () => loadConfig().catch(error => showMessage(error.message, true)));
     loadConfig().catch(error => showMessage(error.message, true));
   </script>

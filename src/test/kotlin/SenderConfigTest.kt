@@ -151,6 +151,167 @@ class SenderConfigTest {
     }
 
     @Test
+    fun `write persists review status check metadata`() {
+        val configDirectory = createTempDirectory().toFile()
+        val configFile = configDirectory.resolve("fcm-sender.json")
+        val store = SenderConfigStore(configFile)
+
+        val saved = store.write(
+            SenderConfigDocument(
+                configs = listOf(
+                    minimalConfig("news").copy(
+                        reviewStatusCheck = ReviewStatusCheckConfig(
+                            packageName = " com.example.news ",
+                            track = " production ",
+                            lastVersion = " 20260601 ",
+                            lastCheckedAt = " 2026-06-02T00:00:00Z ",
+                            lastStatus = ReviewStatusCheckStatus.ONLINE,
+                            lastResult = " VersionCode 20260601 is online. ",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val reviewStatusCheck = saved.configs.orEmpty().single().reviewStatusCheck
+
+        assertEquals("com.example.news", reviewStatusCheck?.packageName)
+        assertEquals("production", reviewStatusCheck?.track)
+        assertEquals("20260601", reviewStatusCheck?.lastVersion)
+        assertEquals("2026-06-02T00:00:00Z", reviewStatusCheck?.lastCheckedAt)
+        assertEquals(ReviewStatusCheckStatus.ONLINE, reviewStatusCheck?.lastStatus)
+        assertEquals("VersionCode 20260601 is online.", reviewStatusCheck?.lastResult)
+        assertTrue(configFile.readText().contains("\"reviewStatusCheck\""))
+    }
+
+    @Test
+    fun `review status check without package name records first failure result`() {
+        val checked = ReviewStatusChecker().check(
+            minimalConfig("news").copy(reviewStatusCheck = ReviewStatusCheckConfig()),
+            versionCode = 20260601,
+        )
+        val config = checked.config
+
+        assertEquals("20260601", config.lastVersion)
+        assertEquals(ReviewStatusCheckStatus.FAILED, config.lastStatus)
+        assertTrue(config.lastCheckedAt?.isNotBlank() == true)
+        assertEquals("Google Play package name is not configured.", config.lastResult)
+    }
+
+    @Test
+    fun `review status check preserves previous successful result after later failure`() {
+        val checked = ReviewStatusChecker { _, _, _ -> error("network down") }.check(
+            minimalConfig("news").copy(
+                reviewStatusCheck = ReviewStatusCheckConfig(
+                    packageName = "com.example.news",
+                    track = "production",
+                    lastVersion = "20260601",
+                    lastCheckedAt = "2026-06-02T00:00:00Z",
+                    lastStatus = ReviewStatusCheckStatus.ONLINE,
+                    lastResult = "VersionCode 20260601 is online on production.",
+                ),
+            ),
+            versionCode = 20260602,
+        )
+        val config = checked.config
+
+        assertEquals("network down", checked.error)
+        assertEquals("20260601", config.lastVersion)
+        assertEquals("2026-06-02T00:00:00Z", config.lastCheckedAt)
+        assertEquals(ReviewStatusCheckStatus.ONLINE, config.lastStatus)
+        assertEquals("VersionCode 20260601 is online on production.", config.lastResult)
+    }
+
+    @Test
+    fun `review status check marks published release as online`() {
+        val checked = ReviewStatusChecker { _, _, _ -> AppStatusLookupResult(AppStatus.ONLINE, lifecycleState = "RELEASE_LIFECYCLE_STATE_PUBLISHED") }.check(
+            minimalConfig("news").copy(
+                reviewStatusCheck = ReviewStatusCheckConfig(
+                    packageName = "com.example.news",
+                    track = "production",
+                ),
+            ),
+            versionCode = 20260601,
+        )
+
+        assertEquals(ReviewStatusCheckStatus.ONLINE, checked.config.lastStatus)
+        assertTrue(checked.config.lastResult?.contains("Track production is online") == true)
+    }
+
+    @Test
+    fun `published release lifecycle state is treated as online`() {
+        assertEquals(true, isOnlineReleaseLifecycleState("RELEASE_LIFECYCLE_STATE_PUBLISHED"))
+        assertEquals(false, isOnlineReleaseLifecycleState("completed"))
+        assertEquals(false, isOnlineReleaseLifecycleState("inProgress"))
+    }
+
+    @Test
+    fun `review status check maps in review state`() {
+        val checked = ReviewStatusChecker { _, _, _ ->
+            AppStatusLookupResult(AppStatus.IN_REVIEW, lifecycleState = "RELEASE_LIFECYCLE_STATE_IN_REVIEW")
+        }.check(
+            minimalConfig("news").copy(
+                reviewStatusCheck = ReviewStatusCheckConfig(packageName = "com.example.news", track = "production"),
+            ),
+            versionCode = 20260601,
+        )
+
+        assertEquals(ReviewStatusCheckStatus.IN_REVIEW, checked.config.lastStatus)
+        assertTrue(checked.config.lastResult?.contains("in review or pending publish") == true)
+    }
+
+    @Test
+    fun `review status check maps rejected state`() {
+        val checked = ReviewStatusChecker { _, _, _ ->
+            AppStatusLookupResult(AppStatus.REJECTED, lifecycleState = "RELEASE_LIFECYCLE_STATE_NOT_APPROVED")
+        }.check(
+            minimalConfig("news").copy(
+                reviewStatusCheck = ReviewStatusCheckConfig(packageName = "com.example.news", track = "production"),
+            ),
+            versionCode = 20260601,
+        )
+
+        assertEquals(ReviewStatusCheckStatus.REJECTED, checked.config.lastStatus)
+    }
+
+    @Test
+    fun `review status check preserves previous result for permission denied`() {
+        val checked = ReviewStatusChecker { _, _, _ ->
+            AppStatusLookupResult(AppStatus.PERMISSION_DENIED, detail = "The caller does not have permission")
+        }.check(
+            minimalConfig("news").copy(
+                reviewStatusCheck = ReviewStatusCheckConfig(
+                    packageName = "com.example.news",
+                    track = "production",
+                    lastVersion = "20260601",
+                    lastCheckedAt = "2026-06-02T00:00:00Z",
+                    lastStatus = ReviewStatusCheckStatus.ONLINE,
+                    lastResult = "Track production is online for package status query.",
+                ),
+            ),
+            versionCode = 20260602,
+        )
+
+        assertEquals(ReviewStatusCheckStatus.PERMISSION_DENIED, checked.config.lastStatus)
+        assertTrue(checked.config.lastResult?.contains("permission denied") == true)
+    }
+
+    @Test
+    fun `review status check defaults track to alpha`() {
+        val reviewStatusCheck = ReviewStatusCheckConfig(track = null).validated()
+
+        assertEquals("alpha", reviewStatusCheck.track)
+    }
+
+    @Test
+    fun `review status check rejects unsupported track`() {
+        val error = assertFailsWith<IllegalArgumentException> {
+            ReviewStatusCheckConfig(track = "product").validated()
+        }
+
+        assertEquals("reviewStatusCheck.track must be one of production, beta, internal, alpha.", error.message)
+    }
+
+    @Test
     fun `service account falls back to firebase adminsdk file in same directory`() {
         val configDirectory = createTempDirectory().toFile()
         val missingConfiguredFile = configDirectory.resolve("google-firebase-account.json")

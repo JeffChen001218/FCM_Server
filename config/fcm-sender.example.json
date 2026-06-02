@@ -4,7 +4,7 @@
     {
       "id": "trash-shield",
       "name": "Trash Shield",
-      "enabled": true,
+      "enabled": false,
       "googleServiceAccount": {
         "path": "Trash Shield/google-service-account.json"
       },
@@ -23,6 +23,14 @@
         "priority": "high",
         "channelId": "default",
         "clickAction": "OPEN_MAIN"
+      },
+      "reviewStatusCheck": {
+        "packageName": "com.example.trashshield",
+        "track": "alpha",
+        "lastVersion": null,
+        "lastCheckedAt": null,
+        "lastStatus": null,
+        "lastResult": null
       }
     }
   ]
